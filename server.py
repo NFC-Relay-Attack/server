@@ -6,6 +6,7 @@ import ssl
 import struct
 import datetime
 import sys
+import time
 
 HOST = "0.0.0.0"
 PORT = 5566
@@ -61,6 +62,7 @@ class NFCGateClientHandler(socketserver.StreamRequestHandler):
             if len(msg_len_data) < 5:
                 break
 
+            recv_time = datetime.datetime.now()  # 패킷 수신 시간 기록
             msg_len, session = struct.unpack("!IB", msg_len_data)
             data = self.rfile.read(msg_len)
             self.log("server", "data:", bytes(data))
@@ -78,7 +80,7 @@ class NFCGateClientHandler(socketserver.StreamRequestHandler):
                 self.server.add_client(self, session)
 
             # allow plugins to filter data before sending it to all clients in the session
-            self.server.send_to_clients(self.session, self.server.plugins.filter(self, data), self)
+            self.server.send_to_clients(self.session, self.server.plugins.filter(self, data), self, recv_time)
 
     def finish(self):
         super().finish()
@@ -130,7 +132,7 @@ class NFCGateServer(socketserver.ThreadingTCPServer):
         self.clients[session].remove(client)
         client.log("left session", session)
 
-    def send_to_clients(self, session, msgs, origin):
+    def send_to_clients(self, session, msgs, origin, recv_time=None):
         if session is None or session not in self.clients:
             return
 
@@ -143,8 +145,18 @@ class NFCGateServer(socketserver.ThreadingTCPServer):
                 msgs = [msgs]
 
             for msg in msgs:
+                # 딜레이 추가
+                if hasattr(self, 'packet_delay') and self.packet_delay > 0:
+                    time.sleep(self.packet_delay)
+                
+                send_time = datetime.datetime.now()
                 client.wfile.write(int.to_bytes(len(msg), 4, byteorder='big'))
                 client.wfile.write(msg)
+                
+                # 전송 시간 계산 및 출력
+                if recv_time:
+                    elapsed = (send_time - recv_time).total_seconds() * 1000  # ms 단위
+                    self.log(f"Packet latency: {elapsed:.2f}ms (recv->send)")
 
         self.log("Publish reached", len(self.clients[session]) - 1, "clients")
 
@@ -156,6 +168,8 @@ def parse_args():
                         default=False, action="store_true")
     parser.add_argument("--tls_cert", help="TLS certificate file in PEM format.", action="store")
     parser.add_argument("--tls_key", help="TLS key file in PEM format.", action="store")
+    parser.add_argument("--delay", type=float, default=0.0, 
+                        help="Packet delay in seconds (e.g., 0.1 for 100ms, 0.5 for 500ms)")
 
     args = parser.parse_args()
     tls_options = None
@@ -176,12 +190,16 @@ def parse_args():
         except ssl.SSLError:
             print("Certificate or key could not be loaded. Please check format and file permissions!")
             sys.exit(1)
-    return args.plugins, tls_options
+    return args.plugins, tls_options, args.delay
 
 
 def main():
-    plugins, tls_options = parse_args()
-    NFCGateServer((HOST, PORT), NFCGateClientHandler, plugins, tls_options).serve_forever()
+    plugins, tls_options, delay = parse_args()
+    server = NFCGateServer((HOST, PORT), NFCGateClientHandler, plugins, tls_options)
+    server.packet_delay = delay
+    if delay > 0:
+        print(f"Packet delay enabled: {delay * 1000:.1f}ms")
+    server.serve_forever()
 
 
 if __name__ == "__main__":
