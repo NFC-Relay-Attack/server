@@ -2,6 +2,8 @@ import re
 import pandas as pd
 import sys
 import os
+from datetime import datetime
+from collections import deque
 from rich.console import Console
 from rich.table import Table
 
@@ -9,6 +11,7 @@ console = Console()
 
 columns = [
     ("timestamp", "cyan"),
+    ("time_delta", "bright_cyan"),
     ("command_type", "yellow"),
     ("CLA", "green"),
     ("INS", "green"),
@@ -237,6 +240,20 @@ def parse_spake2_verify_payload(payload):
         i += 4 + length
     return fields
 
+def calculate_time_delta(prev_server_time, next_server_time):
+    """
+    이전 server 시간과 다음 server 시간의 차이를 계산 (ms)
+    """
+    if prev_server_time and next_server_time:
+        try:
+            prev_dt = datetime.strptime(prev_server_time, "%Y-%m-%d %H:%M:%S.%f")
+            next_dt = datetime.strptime(next_server_time, "%Y-%m-%d %H:%M:%S.%f")
+            delta = (next_dt - prev_dt).total_seconds() * 1000  # ms
+            return f"{delta:.2f}ms"
+        except Exception as e:
+            return ""
+    return ""
+
 def get_output_filename(input_filename):
     base, ext = os.path.splitext(input_filename)
     return f"{base}_parsing.csv"
@@ -254,6 +271,7 @@ def print_data_row(parsed):
         table.add_column(f"[{color}]{col}[/{color}]")
     table.add_row(
         f"[cyan]{parsed['timestamp']}[/cyan]",
+        f"[bright_cyan]{parsed.get('time_delta','')}[/bright_cyan]",
         f"[bold yellow]{parsed['command_type']}[/bold yellow]",
         f"[green]{parsed.get('CLA','')}[/green]",
         f"[green]{parsed.get('INS','')}[/green]",
@@ -261,63 +279,180 @@ def print_data_row(parsed):
         f"[green]{parsed.get('P2','')}[/green]",
         f"[green]{parsed.get('Lc','')}[/green]",
         f"[magenta]{parsed.get('payload','')}[/magenta]",
+        f"[white]{parsed.get('protocol_version','')}[/white]",
+        f"[white]{parsed.get('vehicle_ePK','')}[/white]",
+        f"[white]{parsed.get('transaction_identifier','')}[/white]",
+        f"[white]{parsed.get('vehicle_identifier','')}[/white]",
+        f"[white]{parsed.get('endpoint_ePK','')}[/white]",
+        f"[white]{parsed.get('cryptogram','')}[/white]",
+        f"[white]{parsed.get('curve_point_y','')}[/white]",
+        f"[white]{parsed.get('vehicle_evi_m1','')}[/white]",
         f"[red]{parsed.get('command_mac','')}[/red]",
         f"[blue]{parsed.get('response_mac','')}[/blue]",
         f"[white]{parsed.get('status','')}[/white]",
     )
     console.print(table)
 
-def parse_and_print_line(line):
-    pattern = re.compile(
-        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[log\].*?:.*?([0-9a-fA-F]{4,})\s*$"
-    )
-    m = pattern.search(line)
-    if m:
-        timestamp = m.group(1)
-        data = m.group(2).lower()
-        cmd_type, parsed = classify_and_parse_apdu(data)
-        parsed['timestamp'] = timestamp
-        parsed['command_type'] = cmd_type
-        print_data_row(parsed)
+
+class RealtimeLogBuffer:
+    """실시간 로그를 버퍼링하며 time_delta를 계산하는 클래스"""
+    
+    def __init__(self, buffer_size=30):
+        self.buffer = deque(maxlen=buffer_size)  # 최근 N개 라인 저장
+        self.pending_logs = deque()  # 출력 대기 중인 log 데이터들
+        self.server_data_pattern = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[server\].*server data:"
+        )
+        self.publish_pattern = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[server\].*Publish reached"
+        )
+        self.log_pattern = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[log\].*?:.*?([0-9a-fA-F]{4,})\s*$"
+        )
+        self.prev_command_type = None
         
-def live_parse(filename):
-    print("timestamp,command_type,CLA,INS,P1,P2,Lc,payload,command_mac,response_mac,status")
-    with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
-        f.seek(0, os.SEEK_END)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.2)
-                continue
-            parse_and_print_line(line)
+    def process_line(self, line):
+        """라인을 처리하고, 출력 가능한 파싱된 데이터들을 반환"""
+        self.buffer.append(line)
+        output_list = []
+        
+        # [log] 라인인 경우
+        log_match = self.log_pattern.search(line)
+        if log_match:
+            timestamp = log_match.group(1)
+            data = log_match.group(2).lower()
+            cmd_type, parsed = classify_and_parse_apdu(data, self.prev_command_type)
+            parsed['timestamp'] = timestamp
+            parsed['command_type'] = cmd_type
+            
+            # command인 경우 prev_command_type 갱신
+            if cmd_type not in ["UNKNOWN", "CONTROL FLOW response"] and "response" not in cmd_type:
+                self.prev_command_type = cmd_type
+            
+            # 이전 "server data:" 찾기
+            prev_server_time = None
+            buffer_list = list(self.buffer)
+            current_idx = len(buffer_list) - 1
+            
+            for i in range(current_idx - 1, -1, -1):
+                server_data_match = self.server_data_pattern.search(buffer_list[i])
+                if server_data_match:
+                    prev_server_time = server_data_match.group(1)
+                    break
+            
+            # pending_logs에 추가 (아직 publish가 안 왔으므로)
+            self.pending_logs.append({
+                'parsed': parsed,
+                'prev_server_time': prev_server_time,
+            })
+            
+            # 너무 많이 쌓이면 오래된 것부터 강제 출력 (타임아웃)
+            if len(self.pending_logs) > 20:
+                oldest = self.pending_logs.popleft()
+                oldest['parsed']['time_delta'] = "TIMEOUT"
+                output_list.append(oldest['parsed'])
+        
+        # [server] Publish reached 라인인 경우
+        publish_match = self.publish_pattern.search(line)
+        if publish_match:
+            publish_time = publish_match.group(1)
+            
+            # pending_logs의 모든 log에 대해 time_delta 계산 후 출력
+            while self.pending_logs:
+                log_data = self.pending_logs.popleft()
+                prev_time = log_data['prev_server_time']
+                time_delta = calculate_time_delta(prev_time, publish_time)
+                log_data['parsed']['time_delta'] = time_delta
+                output_list.append(log_data['parsed'])
+        
+        return output_list
+
+
+def parse_stdin_realtime():
+    """실시간 stdin 파싱 - Publish reached가 올 때까지 대기"""
+    print_header_box()
+    buffer = RealtimeLogBuffer(buffer_size=30)
+    
+    for line in sys.stdin:
+        results = buffer.process_line(line)
+        for result in results:
+            print_data_row(result)
+
 
 def main(input_filename, live_mode=False):
     if live_mode:
-        live_parse(input_filename)
+        import time
+        print("timestamp,time_delta,command_type,CLA,INS,P1,P2,Lc,payload,command_mac,response_mac,status")
+        with open(input_filename, 'r', encoding='utf-8', errors='ignore') as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                parse_and_print_line(line)
         return
 
     output_filename = get_output_filename(input_filename)
-    pattern = re.compile(
+    
+    # 패턴 정의
+    server_data_pattern = re.compile(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[server\].*server data:"
+    )
+    publish_pattern = re.compile(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[server\].*Publish reached"
+    )
+    log_pattern = re.compile(
         r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[log\].*?:.*?([0-9a-fA-F]{4,})\s*$"
     )
+    
+    # 전체 라인 읽기
+    all_lines = []
+    with open(input_filename, 'r', encoding='utf-8', errors='ignore') as f:
+        all_lines = f.readlines()
+    
     results = []
     prev_command_type = None
-    with open(input_filename, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            m = pattern.search(line)
-            if m:
-                timestamp = m.group(1)
-                data = m.group(2).lower()
-                cmd_type, parsed = classify_and_parse_apdu(data, prev_command_type)
-                parsed['timestamp'] = timestamp
-                parsed['command_type'] = cmd_type
-                results.append(parsed)
-                # command인 경우에만 prev_command_type 갱신
-                if cmd_type not in ["UNKNOWN", "CONTROL FLOW response"] and "response" not in cmd_type:
-                    prev_command_type = cmd_type
+    
+    for i, line in enumerate(all_lines):
+        log_match = log_pattern.search(line)
+        if not log_match:
+            continue
+            
+        timestamp = log_match.group(1)
+        data = log_match.group(2).lower()
+        cmd_type, parsed = classify_and_parse_apdu(data, prev_command_type)
+        parsed['timestamp'] = timestamp
+        parsed['command_type'] = cmd_type
+        
+        # time_delta 계산
+        prev_server_time = None
+        next_server_time = None
+        
+        # 이전 "server data:" 찾기
+        for j in range(i-1, max(0, i-10), -1):
+            server_data_match = server_data_pattern.search(all_lines[j])
+            if server_data_match:
+                prev_server_time = server_data_match.group(1)
+                break
+        
+        # 다음 "Publish reached" 찾기
+        for j in range(i+1, min(len(all_lines), i+10)):
+            publish_match = publish_pattern.search(all_lines[j])
+            if publish_match:
+                next_server_time = publish_match.group(1)
+                break
+        
+        parsed['time_delta'] = calculate_time_delta(prev_server_time, next_server_time)
+        results.append(parsed)
+        
+        # command인 경우에만 prev_command_type 갱신
+        if cmd_type not in ["UNKNOWN", "CONTROL FLOW response"] and "response" not in cmd_type:
+            prev_command_type = cmd_type
+    
     df = pd.DataFrame(results, dtype=str)
     cols = [
-        "timestamp", "command_type", "CLA", "INS", "P1", "P2", "Lc",
+        "timestamp", "time_delta", "command_type", "CLA", "INS", "P1", "P2", "Lc",
         "payload", "protocol_version", "vehicle_ePK", "transaction_identifier", "vehicle_identifier", 
         "endpoint_ePK", "cryptogram",
         "curve_point_y", "vehicle_evi_m1",
@@ -329,11 +464,10 @@ def main(input_filename, live_mode=False):
     df.to_csv(output_filename, index=False, na_rep='')
     print(f"Parsing complete! Saved as {output_filename}")
 
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--stdin":
-        print_header_box()
-        for line in sys.stdin:
-            parse_and_print_line(line)
+        parse_stdin_realtime()
     elif len(sys.argv) == 2:
         main(sys.argv[1])
     else:
