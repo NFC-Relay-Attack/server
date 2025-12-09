@@ -298,8 +298,8 @@ class RealtimeLogBuffer:
     """실시간 로그를 버퍼링하며 time_delta를 계산하는 클래스"""
     
     def __init__(self, buffer_size=30):
-        self.buffer = deque(maxlen=buffer_size)  # 최근 N개 라인 저장
-        self.pending_logs = deque()  # 출력 대기 중인 log 데이터들
+        self.buffer = deque(maxlen=buffer_size)
+        self.pending_logs = deque()
         self.server_data_pattern = re.compile(
             r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+\[server\].*server data:"
         )
